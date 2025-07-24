@@ -1,20 +1,23 @@
 # =================================================================================
 # File: main_model.py
-# Description: Main model architecture, helpers, and demonstration script.
+# Description: Main model architecture that integrates all components.
 # =================================================================================
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
 from functools import partial
 from typing import Optional
-import torch.nn.functional as F
 
-# Imports from other modules
+# --- Imports from other project files ---
+from feature_extractor import get_swin_b_backbone, get_bert_backbone
 from transformer_blocks import VisionLanguageEncoder, TransformerDecoder, TransformerDecoderLayer
-from feature_extractor import get_bert_backbone, get_swin_b_backbone
+from matcher_and_criterion import HungarianMatcher3D, SetCriterion
 
-# --- Helper Functions and Classes for the Main Model ---
+# =================================================================================
+# SECTION 1: HELPER CLASSES & FUNCTIONS FOR THE MAIN MODEL
+# =================================================================================
 
 def furthest_point_sample(xyz, npoint):
     """A simple PyTorch implementation of Furthest Point Sampling."""
@@ -55,22 +58,14 @@ class GenericMLP(nn.Module):
     def forward(self, x): return self.mlp(x)
 
 class PositionEmbeddingCoordsSine(nn.Module):
-    """
-    Corrected sinusoidal position embedding for 3D coordinates that handles
-    any dimension size by ensuring sub-dimensions are even.
-    """
     def __init__(self, d_pos=256, temperature=10000, normalize=True):
         super().__init__()
         self.d_pos, self.temperature, self.normalize = d_pos, temperature, normalize
-        
-        # Distribute d_pos into three parts for x, y, z, ensuring each part is even
         d_per_dim = d_pos // 3
         self.d_x = (d_per_dim // 2) * 2
         self.d_y = (d_per_dim // 2) * 2
         self.d_z = d_pos - self.d_x - self.d_y
         assert self.d_z % 2 == 0, f"Remaining dimension for z is not even: {self.d_z}"
-
-        # Denominators for positional encoding
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.dim_t_x = self.temperature ** (2 * torch.arange(self.d_x // 2, device=device) / self.d_x)
         self.dim_t_y = self.temperature ** (2 * torch.arange(self.d_y // 2, device=device) / self.d_y)
@@ -80,18 +75,12 @@ class PositionEmbeddingCoordsSine(nn.Module):
         if self.normalize:
             min_coord, max_coord = input_range
             xyz = (xyz - min_coord) / (max_coord - min_coord + 1e-6)
-            
-        # Calculate sinusoidal embeddings for each coordinate
         pos_x = xyz[..., 0, None] / self.dim_t_x
         pos_y = xyz[..., 1, None] / self.dim_t_y
         pos_z = xyz[..., 2, None] / self.dim_t_z
-        
-        # Apply sin and cos and interleave
         pos_x = torch.stack((pos_x.sin(), pos_x.cos()), dim=-1).flatten(-2)
         pos_y = torch.stack((pos_y.sin(), pos_y.cos()), dim=-1).flatten(-2)
         pos_z = torch.stack((pos_z.sin(), pos_z.cos()), dim=-1).flatten(-2)
-        
-        # Concatenate and permute
         pos = torch.cat((pos_x, pos_y, pos_z), dim=-1)
         return pos.permute(0, 2, 1)
 
@@ -116,17 +105,83 @@ class BoxProcessor:
     def box_parametrization_to_corners(self, center, size, angle):
         return self.dataset_config.box_parametrization_to_corners(center, size, angle)
 
-# --- Main Model Class ---
+# =================================================================================
+# SECTION 2: MAIN MODEL
+# =================================================================================
 
 class VisionLanguage3DBoxModel(nn.Module):
-    def __init__(self, encoder, decoder, dataset_config, encoder_dim=768, decoder_dim=256, num_queries=256, mlp_dropout=0.3):
+    def __init__(self, dataset_config, 
+                 encoder_dim=768, decoder_dim=256, num_queries=256, mlp_dropout=0.3,
+                 enc_layers=4, enc_nhead=12, enc_ffn_dim=3072, enc_dropout=0.1,
+                 dec_layers=6, dec_nhead=8, dec_ffn_dim=2048, dec_dropout=0.1,
+                 cost_class=1.0, cost_center=1.0, cost_size=1.0, cost_angle=1.0,
+                 loss_weight_ce=1.0, loss_weight_center=1.0, loss_weight_size=1.0, loss_weight_angle=1.0):
         super().__init__()
-        self.encoder, self.decoder, self.num_queries = encoder, decoder, num_queries
+        
+        # --- Instantiate Trainable Backbones ---
+        self.rgb_backbone = get_swin_b_backbone(pretrained=True)
+        self.pc_backbone = get_swin_b_backbone(pretrained=True)
+        self.text_backbone, self.tokenizer = get_bert_backbone()
+        
+        # --- Instantiate Transformer Components ---
+        self.encoder = VisionLanguageEncoder(
+            num_layers=enc_layers,
+            d_model=encoder_dim,
+            n_heads=enc_nhead,
+            d_ffn=enc_ffn_dim,
+            dropout=enc_dropout
+        )
+        decoder_layer = TransformerDecoderLayer(
+            d_model=decoder_dim,
+            nhead=dec_nhead,
+            dim_feedforward=dec_ffn_dim,
+            dropout=dec_dropout
+        )
+        self.decoder = TransformerDecoder(
+            decoder_layer,
+            num_layers=dec_layers,
+            return_intermediate=True
+        )
+
+        self.num_queries = num_queries
+        
+        # --- Instantiate Matcher and Criterion ---
+        matcher = HungarianMatcher3D(
+            cost_class=cost_class, 
+            cost_center=cost_center, 
+            cost_size=cost_size, 
+            cost_angle=cost_angle
+        )
+        weight_dict = {
+            'loss_ce': loss_weight_ce, 
+            'loss_center': loss_weight_center, 
+            'loss_size': loss_weight_size, 
+            'loss_angle': loss_weight_angle
+        }
+        losses = ['labels', 'boxes']
+        self.criterion = SetCriterion(
+            num_classes=dataset_config.num_semcls, 
+            matcher=matcher, 
+            weight_dict=weight_dict, 
+            losses=losses
+        )
+        
+        # --- Helper Modules ---
         self.box_processor = BoxProcessor(dataset_config)
-        self.dataset_config = dataset_config # Store dataset_config
+        self.dataset_config = dataset_config
+        
+        # --- Projection Layers ---
+        swin_feat_dim = 1024
+        bert_feat_dim = 768
+        self.rgb_proj = nn.Linear(swin_feat_dim, encoder_dim)
+        self.pc_proj = nn.Linear(swin_feat_dim, encoder_dim)
+        assert bert_feat_dim == encoder_dim, "BERT output dim must match encoder dim"
+
         self.encoder_to_decoder_projection = GenericMLP(encoder_dim, [encoder_dim], decoder_dim, "bn1d", use_conv=True)
         self.pos_embedding = PositionEmbeddingCoordsSine(d_pos=decoder_dim, normalize=True)
         self.query_projection = GenericMLP(decoder_dim, [decoder_dim], decoder_dim, use_conv=True, output_use_activation=True)
+        
+        # --- Prediction Heads ---
         self.build_mlp_heads(dataset_config, decoder_dim, mlp_dropout)
 
     def build_mlp_heads(self, dataset_config, decoder_dim, mlp_dropout):
@@ -144,92 +199,66 @@ class VisionLanguage3DBoxModel(nn.Module):
         return q_xyz, self.query_projection(pos_embed)
 
     def get_box_predictions(self, q_xyz, pc_dims, box_feats):
-        box_feats = box_feats.permute(0, 2, 3, 1) # L, B, C, Q
-        L, B, C, Q = box_feats.shape
-        box_feats = box_feats.reshape(L * B, C, Q)
-        preds = {k: h(box_feats).transpose(1, 2).reshape(L, B, Q, -1) for k, h in self.mlp_heads.items()}
-        preds["center_head"] = preds["center_head"].sigmoid() - 0.5
-        preds["size_head"] = preds["size_head"].sigmoid()
-        # Correctly access the number of angle bins from the dataset_config
-        preds["angle_residual_head"] *= (np.pi / self.dataset_config.num_angle_bin)
+        box_feats_permuted = box_feats.permute(0, 2, 3, 1) # L, B, C, Q
+        L, B, C, Q = box_feats_permuted.shape
+        box_feats_reshaped = box_feats_permuted.reshape(L * B, C, Q)
+        
+        preds = {k: h(box_feats_reshaped).transpose(1, 2).reshape(L, B, Q, -1) for k, h in self.mlp_heads.items()}
+        
+        center_offset = preds["center_head"].sigmoid() - 0.5
+        size_normalized = preds["size_head"].sigmoid()
+        angle_residual_normalized = preds["angle_residual_head"]
+        angle_residual = angle_residual_normalized * (np.pi / self.dataset_config.num_angle_bin)
         
         outputs = []
         for l in range(L):
-            center_norm, center_unnorm = self.box_processor.compute_predicted_center(preds["center_head"][l], q_xyz, pc_dims)
-            size_unnorm = self.box_processor.compute_predicted_size(preds["size_head"][l], pc_dims)
-            angle = self.box_processor.compute_predicted_angle(preds["angle_cls_head"][l], preds["angle_residual_head"][l])
+            center_norm, center_unnorm = self.box_processor.compute_predicted_center(center_offset[l], q_xyz, pc_dims)
+            size_unnorm = self.box_processor.compute_predicted_size(size_normalized[l], pc_dims)
+            angle = self.box_processor.compute_predicted_angle(preds["angle_cls_head"][l], angle_residual[l])
             corners = self.box_processor.box_parametrization_to_corners(center_unnorm, size_unnorm, angle)
             with torch.no_grad():
                 sem_prob, obj_prob = self.box_processor.compute_objectness_and_cls_prob(preds["sem_cls_head"][l])
-            outputs.append({"box_corners": corners, "sem_cls_prob": sem_prob, "objectness_prob": obj_prob})
+            
+            outputs.append({
+                "sem_cls_logits": preds["sem_cls_head"][l], "center_unnormalized": center_unnorm,
+                "size_unnormalized": size_unnorm, "angle_continuous": angle, "box_corners": corners,
+                "sem_cls_prob": sem_prob, "objectness_prob": obj_prob
+            })
         return {"outputs": outputs[-1], "aux_outputs": outputs[:-1]}
 
-    def forward(self, img_features, txt_features, point_cloud_dims):
-        enc_features = self.encoder(img_features, txt_features)
-        print(f"✅ Step 1: Encoder Output Shape: {enc_features.shape}")
+    def forward(self, inputs, targets=None):
+        # 1. Tokenize text and extract features from all three backbones
+        device = inputs['rgb_input'].device
+        tokenized = self.tokenizer(inputs['text_prompts'], padding='longest', return_tensors='pt').to(device)
+        
+        rgb_feats_raw = self.rgb_backbone(inputs['rgb_input'])
+        pc_feats_raw = self.pc_backbone(inputs['pc_input'])
+        text_feats_raw = self.text_backbone(input_ids=tokenized['input_ids'], attention_mask=tokenized['attention_mask'])[0]
+
+        # 2. Project visual features and fuse them
+        rgb_feats = self.rgb_proj(rgb_feats_raw)
+        pc_feats = self.pc_proj(pc_feats_raw)
+        fused_visual_features = rgb_feats + pc_feats
+        
+        # 3. Run the rest of the pipeline
+        enc_features = self.encoder(fused_visual_features, text_feats_raw)
         B, N, _ = enc_features.shape
         H = W = int(math.sqrt(N))
-        grid_y, grid_x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
-        enc_xyz = torch.stack([grid_x.flatten()/ (W-1), grid_y.flatten()/(H-1), torch.zeros_like(grid_x.flatten())], dim=-1).unsqueeze(0).repeat(B, 1, 1).to(enc_features.device)
+        grid_y, grid_x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+        
+        point_cloud_dims = [inputs['point_cloud_dims_min'], inputs['point_cloud_dims_max']]
+        
+        enc_xyz = torch.stack([grid_x.flatten()/(W-1), grid_y.flatten()/(H-1), torch.zeros_like(grid_x.flatten())], dim=-1).unsqueeze(0).repeat(B, 1, 1)
         enc_features_proj = self.encoder_to_decoder_projection(enc_features.permute(0, 2, 1)).permute(2, 0, 1)
         q_xyz, q_embed = self.get_query_embeddings(enc_xyz, point_cloud_dims)
         enc_pos = self.pos_embedding(enc_xyz, input_range=point_cloud_dims).permute(2, 0, 1)
         q_embed = q_embed.permute(2, 0, 1)
         box_features, _ = self.decoder(torch.zeros_like(q_embed), enc_features_proj, query_pos=q_embed, pos=enc_pos)
-        print(f"✅ Step 2: Decoder Output Shape (Box Features): {box_features.shape} (Layers, Queries, Batch, Dim)")
-        return self.get_box_predictions(q_xyz, point_cloud_dims, box_features)
-
-# --- Demonstration Script ---
-if __name__ == '__main__':
-    class DummyDatasetConfig:
-        def __init__(self): self.num_semcls, self.num_angle_bin = 18, 12
-        def box_parametrization_to_corners(self, center, size, angle):
-            B, Q, _ = center.shape
-            l, w, h = size[..., 0], size[..., 1], size[..., 2]
+        
+        predictions = self.get_box_predictions(q_xyz, point_cloud_dims, box_features)
+        
+        if self.training and targets is not None:
+            loss_dict = self.criterion(predictions, targets)
+            return predictions, loss_dict
             
-            x_corners = torch.stack([l/2, l/2, -l/2, -l/2, l/2, l/2, -l/2, -l/2], dim=-1)
-            y_corners = torch.stack([w/2, -w/2, -w/2, w/2, w/2, -w/2, -w/2, w/2], dim=-1)
-            z_corners = torch.stack([h/2, h/2, h/2, h/2, -h/2, -h/2, -h/2, -h/2], dim=-1)
-            corners = torch.stack([x_corners, y_corners, z_corners], dim=-2) # B, Q, 3, 8
-            
-            cos_a, sin_a = torch.cos(angle), torch.sin(angle)
-            # Rotation matrix for Z-axis
-            row1 = torch.stack([cos_a, -sin_a, torch.zeros_like(cos_a)], dim=-1)
-            row2 = torch.stack([sin_a, cos_a, torch.zeros_like(cos_a)], dim=-1)
-            row3 = torch.stack([torch.zeros_like(cos_a), torch.zeros_like(cos_a), torch.ones_like(cos_a)], dim=-1)
-            rot_matrix = torch.stack([row1, row2, row3], dim=-2) # B, Q, 3, 3
-            
-            # Apply rotation
-            rotated_corners = torch.einsum('bqij,bqjk->bqik', rot_matrix, corners)
-            
-            # Add center offset
-            return rotated_corners + center.unsqueeze(-1)
-
-    dataset_config = DummyDatasetConfig()
-    BATCH_SIZE, IMG_PATCHES, TXT_TOKENS = 1, 196, 3
-    ENC_D, DEC_D = 768, 256
-    ENC_L, DEC_L = 4, 6
-    ENC_H, DEC_H = 12, 8
-    N_QUERIES = 128
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    print("--- Initializing Full 3D Box Prediction Model for a Single Example ---")
-    encoder = VisionLanguageEncoder(num_layers=ENC_L, d_model=ENC_D, n_heads=ENC_H).to(device)
-    decoder_layer = TransformerDecoderLayer(d_model=DEC_D, nhead=DEC_H).to(device)
-    decoder = TransformerDecoder(decoder_layer, num_layers=DEC_L, return_intermediate=True).to(device)
-    model = VisionLanguage3DBoxModel(encoder, decoder, dataset_config, encoder_dim=ENC_D, decoder_dim=DEC_D, num_queries=N_QUERIES).to(device)
-
-    # --- Create Dummy Input Data ---
-    image_features = torch.randn(BATCH_SIZE, IMG_PATCHES, ENC_D).to(device)
-    text_features = torch.randn(BATCH_SIZE, TXT_TOKENS, ENC_D).to(device)
-    pc_dims = [torch.tensor([0.,0.,0.]).to(device), torch.tensor([1.,1.,1.]).to(device)]
-
-    print(f"--- Running Forward Pass ---")
-    model.eval()
-    with torch.no_grad():
-        predictions = model(image_features, text_features, pc_dims)
-
-    box_corners = predictions['outputs']['box_corners']
-    print(f"✅ Step 3: Final Bounding Box Corners Shape: {box_corners.shape}")
-    assert box_corners.shape == (BATCH_SIZE, N_QUERIES, 3, 8), "The output shape is incorrect!"
-    print("\n✅ Pipeline execution successful.")
+        return predictions
