@@ -1,0 +1,15 @@
+# .gitignore
+# Ignore Python virtual environments
+venv/
+ENV/
+env/
+sereact/
+# Ignore NumPy binary files
+*.npy
+
+# Ignore image files
+*.png
+
+# Bytecode and cache
+__pycache__/
+*.pyc
