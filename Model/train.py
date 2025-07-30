@@ -1,220 +1,219 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import json
 import os
 import numpy as np
 from PIL import Image
 import timm
+from tqdm import tqdm
+from torch.optim.lr_scheduler import StepLR
+import random
 
-# --- Import the main model and its components ---
-# The user has specified their main model file is named 'main_model.py'
-from main_model import Detector3D, FusionDecoder, FusionDecoderLayer, build_matcher_3d, Encoder
+from main_model import Detector3D
+from encoder import Encoder
+from decoder import FusionDecoder, FusionDecoderLayer
+from main_model import HungarianMatcher3D, SetCriterion3D
 
-# ==============================================================================
-# == Bounding Box Conversion Helper (Unchanged)                               ==
-# ==============================================================================
+def gt_corners_to_8_params(corners):
+    center = corners.mean(axis=0)
+    edge_vector = corners[1, :2] - corners[0, :2]
+    yaw = np.arctan2(edge_vector[1], edge_vector[0])
+    cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+    rotation_matrix = np.array([[cos_yaw, sin_yaw], [-sin_yaw, cos_yaw]])
+    aligned_corners_bev = corners[:, :2] @ rotation_matrix.T
+    bev_min = aligned_corners_bev.min(axis=0)
+    bev_max = aligned_corners_bev.max(axis=0)
+    size_bev = bev_max - bev_min
+    z_min, z_max = corners[:, 2].min(), corners[:, 2].max()
+    size_z = z_max - z_min
+    size = np.array([size_bev[0], size_bev[1], size_z])
+    log_dims = np.log(size + 1e-6)
+    return np.concatenate([center, log_dims, [cos_yaw, sin_yaw]])
 
-def corners_to_center_size_yaw(corners):
-    """
-    Converts 8-corner 3D bounding box representation to the model's 8-parameter format.
-    
-    Args:
-        corners (np.ndarray): Bounding box corners, shape (Num_Objects, 8, 3)
-    
-    Returns:
-        np.ndarray: Bounding boxes in (center_x, center_y, center_z, w, h, l, sin(yaw), cos(yaw))
-                    format, shape (Num_Objects, 8)
-    """
-    processed_boxes = []
-    for box_corners in corners:
-        # Center is the mean of the 8 corner points
-        center = box_corners.mean(axis=0)
-        
-        # To find yaw, we assume the "front" of the box is defined by the first two corners.
-        # This might need adjustment based on your specific dataset's corner ordering.
-        # We calculate the vector of one of the base edges.
-        edge_vector = box_corners[1] - box_corners[0]
-        yaw = np.arctan2(edge_vector[1], edge_vector[0])
-        
-        # To find size, we create a rotation matrix to align the box with the axes.
-        # This makes finding width, height, and length trivial.
-        cos_yaw = np.cos(yaw)
-        sin_yaw = np.sin(yaw)
-        rotation_matrix = np.array([
-            [cos_yaw, -sin_yaw, 0],
-            [sin_yaw,  cos_yaw, 0],
-            [0,        0,       1]
-        ])
-        
-        # Rotate the box corners to be axis-aligned
-        aligned_corners = box_corners @ rotation_matrix.T
-        min_coords = aligned_corners.min(axis=0)
-        max_coords = aligned_corners.max(axis=0)
-        size = max_coords - min_coords
-        
-        # Assemble the 8-parameter representation
-        processed_box = np.concatenate([center, size, [np.sin(yaw), np.cos(yaw)]])
-        processed_boxes.append(processed_box)
-        
-    return np.array(processed_boxes, dtype=np.float32)
+def random_flip_scene(point_cloud, corners):
+    if np.random.rand() > 0.5:
+        point_cloud[:, 1] *= -1
+        corners[:, :, 1] *= -1
+    return point_cloud, corners
 
+def random_rotate_scene(point_cloud, corners):
+    angle = np.random.uniform(-np.pi / 4, np.pi / 4)
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    rot_matrix = np.array([
+        [cos_a, -sin_a, 0],
+        [sin_a,  cos_a, 0],
+        [0, 0, 1]
+    ])
+    point_cloud = point_cloud @ rot_matrix.T
+    num_boxes = corners.shape[0]
+    corners_flat = corners.reshape(num_boxes * 8, 3)
+    rotated_corners_flat = corners_flat @ rot_matrix.T
+    corners = rotated_corners_flat.reshape(num_boxes, 8, 3)
+    return point_cloud, corners
 
-# ==============================================================================
-# == 1. Custom Dataset for 3D Object Detection (Unchanged)                    ==
-# ==============================================================================
+def random_scale_scene(point_cloud, corners):
+    scale = np.random.uniform(0.9, 1.1)
+    point_cloud *= scale
+    corners *= scale
+    return point_cloud, corners
 
 class Custom3DDataset(Dataset):
-    """
-    Custom PyTorch Dataset for loading 3D detection data as described.
-    It reads a .jsonl file where each line points to the data for one frame.
-    """
-    def __init__(self, jsonl_path, data_dir, image_transforms):
-        """
-        Args:
-            jsonl_path (str): Path to the .jsonl manifest file.
-            data_dir (str): Path to the root directory where data files are stored.
-            image_transforms: PyTorch transforms to be applied to the RGB images.
-        """
+    def __init__(self, samples, data_dir, image_transforms, augment=False):
         self.data_dir = data_dir
         self.image_transforms = image_transforms
-        self.samples = []
-        with open(jsonl_path, 'r') as f:
-            for line in f:
-                self.samples.append(json.loads(line))
+        self.samples = samples
+        self.augment = augment
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         sample_info = self.samples[idx]
-        
-        # --- Load RGB Image ---
-        rgb_path = os.path.join(self.data_dir, sample_info['rgb_path'])
-        image = Image.open(rgb_path).convert("RGB")
+        image = Image.open(os.path.join(self.data_dir, sample_info['rgb_path'])).convert("RGB")
         image_tensor = self.image_transforms(image)
-        
-        # --- Load Point Cloud ---
-        pc_path = os.path.join(self.data_dir, sample_info['pc_path'])
-        point_cloud = np.load(pc_path)
-        # Ensure point cloud has shape (N, 3) - this handles the (3, H, W) case
-        if point_cloud.shape[-1] != 3:
-            point_cloud = point_cloud.reshape(-1, 3)
-        pc_tensor = torch.tensor(point_cloud, dtype=torch.float32)
-        
-        # --- Load and Process 3D Bounding Boxes ---
-        bbox_path = os.path.join(self.data_dir, sample_info['bbox3d_path'])
-        bbox_corners = np.load(bbox_path) # Shape (Num_Objects, 8, 3)
-        
-        # Convert the corners to the model's expected 8-parameter format
-        bboxes_8param = corners_to_center_size_yaw(bbox_corners)
-        
-        # Since there is only one class ("Object"), the label for all boxes is 0.
+        point_cloud = np.load(os.path.join(self.data_dir, sample_info['pc_path']))
+        if point_cloud.shape[-1] != 3: point_cloud = point_cloud.reshape(-1, 3)
+        bbox_corners = np.load(os.path.join(self.data_dir, sample_info['bbox3d_path']))
+        if self.augment:
+            point_cloud, bbox_corners = random_flip_scene(point_cloud, bbox_corners)
+            point_cloud, bbox_corners = random_rotate_scene(point_cloud, bbox_corners)
+            point_cloud, bbox_corners = random_scale_scene(point_cloud, bbox_corners)
+        bboxes_8param = np.array([gt_corners_to_8_params(c) for c in bbox_corners])
         labels = torch.zeros(bboxes_8param.shape[0], dtype=torch.long)
-        
-        # Prepare the target dictionary in the format expected by the model
         targets = {
             'labels': labels,
-            'boxes': torch.tensor(bboxes_8param, dtype=torch.float32)
+            'boxes': torch.tensor(bboxes_8param, dtype=torch.float32),
+            'corners': torch.tensor(bbox_corners, dtype=torch.float32)
         }
-        
-        return image_tensor, pc_tensor, targets
+        return image_tensor, torch.tensor(point_cloud, dtype=torch.float32), targets
 
-def collate_fn(batch):
-    """
-    Custom collate function for a batch size of 1.
-    It returns point clouds and targets as lists, which the training loop will handle.
-    """
+def custom_collate_fn(batch):
     images, point_clouds, targets = zip(*batch)
     batched_images = torch.stack(images, 0)
-    # Return point_clouds and targets as lists
-    return batched_images, list(point_clouds), list(targets)
-
-
-# ==============================================================================
-# == 2. Main Training Loop (Updated)                                          ==
-# ==============================================================================
+    max_points = max(pc.shape[0] for pc in point_clouds)
+    padded_pcs = []
+    for pc in point_clouds:
+        padding_needed = max_points - pc.shape[0]
+        if padding_needed > 0:
+            padding = torch.zeros(padding_needed, 3, dtype=pc.dtype, device=pc.device)
+            padded_pc = torch.cat([pc, padding], dim=0)
+            padded_pcs.append(padded_pc)
+        else:
+            padded_pcs.append(pc)
+    batched_point_clouds = torch.stack(padded_pcs, 0)
+    batched_targets = list(targets)
+    return batched_images, batched_point_clouds, batched_targets
 
 if __name__ == '__main__':
-    # ✅ CHANGE: Enable anomaly detection to get a more detailed traceback
-    torch.autograd.set_detect_anomaly(True)
-
-    # --- Configuration ---
-    DATA_DIR = "D:\Assignment\processed_dataset" # Root directory containing rgb, pc, and bbox files
+    DATA_DIR = "/home/animeshmaheshwari/Documents/ImageSegmentation/ObjectDetection/Assignment/processed_dataset"
     JSONL_PATH = os.path.join(DATA_DIR, "dataset.jsonl")
-    EPOCHS = 10
-    # ✅ CHANGE: Set batch size to 1 to process one sample at a time
-    BATCH_SIZE = 1
-    LEARNING_RATE = 1e-4
-    
-    # --- Model Configuration ---
-    class PointNetArgs:
-        use_color = False; enc_dim = 256; preenc_npoints = 2048; enc_type = "vanilla"; enc_nhead = 4; enc_ffn_dim = 128
-        enc_dropout = 0.1; enc_activation = "relu"; enc_nlayers = 3; mlp_dropout = 0.3; nqueries = 256
-    
-    class MatcherArgs:
-        set_cost_class = 2.0; set_cost_bbox = 5.0; focal_alpha = 0.25
-
-    pointnet_args = PointNetArgs()
-    matcher_args = MatcherArgs()
-    
+    RESULTS_DIR = "results"
+    EPOCHS = 50
+    BATCH_SIZE = 4
+    LEARNING_RATE = 5e-5
     NUM_CLASSES = 1
-    NUM_QUERIES = 256
-    FUSION_DIM = 256
-    DECODER_LAYERS = 2
-
+    NUM_QUERIES = 16
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"--- Starting Training on {device} ---")
 
-    # --- 1. Build Model ---
-    print("Building model...")
-    encoder = Encoder(pointnet_args=pointnet_args, fusion_dim=FUSION_DIM)
-    decoder_layer = FusionDecoderLayer(d_model=FUSION_DIM)
-    decoder = FusionDecoder(decoder_layer, num_layers=DECODER_LAYERS, d_model=FUSION_DIM, num_classes=NUM_CLASSES + 1, num_queries=NUM_QUERIES)
-    matcher = build_matcher_3d(args=matcher_args)
-    model = Detector3D(encoder, decoder, matcher, num_classes=NUM_CLASSES).to(device)
-    print("✅ Model built successfully!")
+    print("Splitting dataset...")
+    with open(JSONL_PATH, 'r') as f:
+        all_samples = [json.loads(line) for line in f]
+    num_samples = len(all_samples)
+    indices = list(range(num_samples))
+    random.shuffle(indices)
+    test_split = int(np.floor(0.2 * num_samples))
+    val_split = int(np.floor(0.1 * (num_samples - test_split)))
+    test_indices = indices[:test_split]
+    train_val_indices = indices[test_split:]
+    val_indices = train_val_indices[:val_split]
+    train_indices = train_val_indices[val_split:]
+    train_samples = [all_samples[i] for i in train_indices]
+    val_samples = [all_samples[i] for i in val_indices]
+    test_samples = [all_samples[i] for i in test_indices]
 
-    # --- 2. Prepare Dataset ---
-    print("Loading dataset...")
+    print(f"Total samples: {num_samples}")
+    print(f"Training samples: {len(train_samples)}")
+    print(f"Validation samples: {len(val_samples)}")
+    print(f"Test samples: {len(test_samples)}")
+
+    class PointNetArgs:
+        use_color = False; enc_dim = 256; preenc_npoints = 2048; enc_type = "vanilla"
+        enc_nhead = 4; enc_ffn_dim = 128; enc_dropout = 0.1; enc_activation = "relu"
+        enc_nlayers = 5; mlp_dropout = 0.3; nqueries = NUM_QUERIES
+
+    encoder = Encoder(pointnet_args=PointNetArgs(), fusion_dim=256)
+    decoder_layer = FusionDecoderLayer(d_model=256)
+    decoder = FusionDecoder(decoder_layer, num_layers=6, d_model=256, num_classes=NUM_CLASSES, num_queries=NUM_QUERIES)
+    matcher = HungarianMatcher3D(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
+    weight_dict = {'loss_ce': 2.0, 'loss_bbox': 5.0, 'loss_giou': 10.0}
+    criterion = SetCriterion3D(num_classes=NUM_CLASSES, matcher=matcher, weight_dict=weight_dict).to(device)
+    model = Detector3D(encoder, decoder, criterion).to(device)
+
     dummy_swin = timm.create_model('swin_base_patch4_window7_224', pretrained=False)
     data_config = timm.data.resolve_model_data_config(dummy_swin)
-    image_transforms = timm.data.create_transform(**data_config, is_training=True)
-    
-    dataset = Custom3DDataset(jsonl_path=JSONL_PATH, data_dir=DATA_DIR, image_transforms=image_transforms)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, collate_fn=collate_fn)
-    print(f"✅ Dataset loaded with {len(dataset)} samples.")
+    train_transforms = timm.data.create_transform(**data_config, is_training=True)
+    val_test_transforms = timm.data.create_transform(**data_config, is_training=False)
 
-    # --- 3. Setup Optimizer ---
+    train_dataset = Custom3DDataset(train_samples, DATA_DIR, train_transforms, augment=True)
+    val_dataset = Custom3DDataset(val_samples, DATA_DIR, val_test_transforms, augment=False)
+    test_dataset = Custom3DDataset(test_samples, DATA_DIR, val_test_transforms, augment=False)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, collate_fn=custom_collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, collate_fn=custom_collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, collate_fn=custom_collate_fn)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    lr_scheduler = StepLR(optimizer, step_size=20, gamma=0.1)
 
-    # --- 4. Training Loop ---
-    model.train()
+    os.makedirs(os.path.join(RESULTS_DIR, 'logs'), exist_ok=True)
+    writer = SummaryWriter(log_dir=os.path.join(RESULTS_DIR, 'logs'))
+
     for epoch in range(EPOCHS):
-        total_loss = 0
-        for i, (images, point_clouds, targets) in enumerate(dataloader):
+        model.train()
+        loop = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{EPOCHS}] Training")
+        for i, (images, point_clouds, targets_list) in enumerate(loop):
             images = images.to(device)
-            # ✅ CHANGE: Since batch size is 1, `point_clouds` is a list with one tensor.
-            # We stack it to create a single tensor of shape (1, N, 3) for the model.
-            point_clouds_tensor = torch.stack(point_clouds, 0).to(device)
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            loss = model(images, point_clouds_tensor, targets=targets)
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"⚠️ Invalid loss detected at epoch {epoch+1}, batch {i+1}. Skipping batch.")
+            point_clouds = point_clouds.to(device)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets_list]
+            loss, loss_dict = model(images, point_clouds, targets=targets)
+            if torch.isnan(loss): 
+                print(f"NaN loss detected at epoch {epoch+1}, batch {i}. Skipping batch.")
                 continue
-
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
             optimizer.step()
-            
-            total_loss += loss.item()
-            
-            if (i + 1) % 10 == 0:
-                print(f"Epoch [{epoch+1}/{EPOCHS}], Batch [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
-        
-        avg_loss = total_loss / len(dataloader)
-        print(f"--- Epoch {epoch+1} Finished --- Average Loss: {avg_loss:.4f} ---")
+            global_step = epoch * len(train_loader) + i
+            writer.add_scalar('Train/loss_total', loss.item(), global_step)
+            for k, v in loss_dict.items():
+                writer.add_scalar(f'Train/{k}', v.item(), global_step)
+            loop.set_postfix(loss=loss.item(), giou=loss_dict['loss_giou'].item())
 
-    print("\n🎉 Training complete!")
+        model.eval()
+        total_val_loss = 0
+        val_loop = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{EPOCHS}] Validation", leave=False)
+        with torch.no_grad():
+            for images, point_clouds, targets_list in val_loop:
+                images = images.to(device)
+                point_clouds = point_clouds.to(device)
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets_list]
+                outputs = model(images, point_clouds, targets=None)
+                loss, loss_dict_details = criterion(outputs, targets)
+                if not torch.isnan(loss):
+                    total_val_loss += loss.item()
+        avg_val_loss = total_val_loss / len(val_loader) if len(val_loader) > 0 else 0
+        writer.add_scalar('Validation/avg_loss_epoch', avg_val_loss, epoch)
+        print(f"Epoch [{epoch+1}/{EPOCHS}] - Avg Validation Loss: {avg_val_loss:.4f}")
+        lr_scheduler.step()
+
+    writer.close()
+    print("\nTraining complete!")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    save_path = os.path.join(RESULTS_DIR, "detector3d_final.pth")
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
+    print("\n--- Test Set Sample Indices ---")
+    print(f"The following {len(test_indices)} indices (from the original dataset.jsonl) form the test set:")
+    print(sorted(test_indices))

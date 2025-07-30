@@ -1,8 +1,8 @@
 import os
 import shutil
 
-src_root = "D:\Assignment\dl_challenge"       # Change as needed
-dst_root = "processed_dataset"      # Change as needed
+src_root = "D:\Assignment\dl_challenge"
+dst_root = "processed_dataset"
 os.makedirs(dst_root, exist_ok=True)
 
 counter = 1
@@ -23,4 +23,4 @@ for folder in os.listdir(src_root):
     
     counter += 1
 
-print("✅ Files renamed and copied.")
+print("Files renamed and copied.")

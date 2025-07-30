@@ -5,7 +5,6 @@ import timm
 from PIL import Image
 from torchvision import transforms
 
-# --- Helper Function to Generate 2D Reference Points ---
 def get_reference_points(H, W, device):
     y, x = torch.meshgrid(
         torch.linspace(0.5, H - 0.5, H, device=device),
@@ -17,7 +16,6 @@ def get_reference_points(H, W, device):
     ref_points = torch.stack((x, y), -1)
     return ref_points
 
-# --- 2D Deformable Self-Attention Module (Corrected) ---
 class MultiHeadDeformableAttention2D(nn.Module):
     def __init__(self, embed_dim, num_heads, num_sampling_points):
         super().__init__()
@@ -49,38 +47,24 @@ class MultiHeadDeformableAttention2D(nn.Module):
         
         query_for_sampling = query.permute(0, 3, 1, 2)
         
-        # Reshape grid for grid_sample
         sampling_grid = (sampling_locations.reshape(N * self.num_heads, L, self.num_sampling_points, 2) * 2) - 1
-
-        # We need to sample from the query for each head.
-        # So we expand the query to match the grid's batch size (N * Heads)
         query_expanded = query_for_sampling.repeat_interleave(self.num_heads, dim=0)
 
-        # Sample features from the expanded query
-        # Output shape: (N * Heads, E, L, K)
         sampled_features_raw = F.grid_sample(
             query_expanded, sampling_grid, mode='bilinear', padding_mode='zeros', align_corners=False
         )
         
-        # Reshape and permute to bring features into a usable format
-        # (N * Heads, E, L, K) -> (N, Heads, L, K, E)
         sampled_features = sampled_features_raw.view(N, self.num_heads, E, L, self.num_sampling_points)
         sampled_features = sampled_features.permute(0, 1, 3, 4, 2)
 
-        # Apply attention weights and sum over sampling points
-        # (N, Heads, L, K, E) * (N, Heads, L, K, 1) -> sum -> (N, Heads, L, E)
         output = (sampled_features * attention_weights.unsqueeze(-1)).sum(dim=3)
-
-        # Combine heads. A simple and effective way is to average them.
-        output = output.mean(dim=1)  # Average across the heads dimension -> (N, L, E)
+        output = output.mean(dim=1)
         
-        # Reshape back to 2D spatial format and apply final projection
         output = output.view(N, H, W, E)
         output = self.output_proj(output)
         
         return output
 
-# --- Main Execution ---
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     

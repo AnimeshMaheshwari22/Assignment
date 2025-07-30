@@ -1,82 +1,84 @@
 import os
-import re
+import sys
 import numpy as np
-import cv2
-import matplotlib.pyplot as plt
+from typing import Union, Optional
+import open3d as o3d
+from PIL import Image
+import numpy.typing as npt
 
-def visualize_sample(idx, data_dir, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
 
-    rgb_path = os.path.join(data_dir, f"rgb_img_{idx}.png")
-    mask_path = os.path.join(data_dir, f"mask_{idx}.npy")
-    pc_path = os.path.join(data_dir, f"pc_{idx}.npy")
+def load_array(source: Union[str, npt.NDArray]) -> np.ndarray:
+    if isinstance(source, str):
+        if not os.path.isfile(source):
+            raise FileNotFoundError(f"File not found: {source}")
+        return np.load(source)
+    elif isinstance(source, np.ndarray):
+        return source
+    else:
+        raise ValueError(f"Invalid input type: {type(source)}")
 
-    # Load data
-    try:
-        rgb = cv2.imread(rgb_path)
-        rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        mask = np.load(mask_path)  # (N_instances, H, W)
-        pc = np.load(pc_path)      # (3, H, W)
-    except Exception as e:
-        print(f"[!] Skipping index {idx}: {e}")
-        return
 
-    # Generate mask overlay
-    mask_overlay = rgb.copy()
-    num_instances = mask.shape[0]
-    colors = plt.cm.get_cmap("tab10", num_instances)
+def prepare_point_cloud(raw_pc: np.ndarray, image: Optional[np.ndarray] = None) -> o3d.geometry.PointCloud:
+    if raw_pc.ndim == 3 and raw_pc.shape[0] == 3:
+        raw_pc = raw_pc.transpose(1, 2, 0).reshape(-1, 3)
 
-    for i in range(num_instances):
-        instance_mask = mask[i].astype(np.uint8) * 255
-        contours, _ = cv2.findContours(instance_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        color = (np.array(colors(i)[:3]) * 255).astype(np.uint8).tolist()
-        cv2.drawContours(mask_overlay, contours, -1, color, 2)
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(raw_pc.astype(np.float64))
 
-    # Compute norm of point cloud
-    x, y, z = pc[0], pc[1], pc[2]
-    norm = np.sqrt(x**2 + y**2 + z**2)
-    norm_valid = np.where(np.isfinite(norm), norm, np.nan)
-    norm_min, norm_max = np.nanmin(norm_valid), np.nanmax(norm_valid)
-    norm_normalized = (norm_valid - norm_min) / (norm_max - norm_min + 1e-6)
-    pc_colormap = plt.cm.viridis(norm_normalized)
-    pc_colormap = (pc_colormap[:, :, :3] * 255).astype(np.uint8)
+    if image is not None:
+        if image.shape[0] != raw_pc.shape[1] or image.shape[1] != raw_pc.shape[2]:
+            image = np.resize(image, (raw_pc.shape[1], raw_pc.shape[2], 3))
+        color_vals = image.reshape(-1, 3).astype(np.float64) / 255.0
+        cloud.colors = o3d.utility.Vector3dVector(color_vals)
 
-    # Create figure and save
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    
-    axs[0].imshow(rgb)
-    axs[0].set_title(f"RGB Image {idx}")
-    axs[0].axis("off")
+    return cloud
 
-    axs[1].imshow(mask_overlay)
-    axs[1].set_title(f"Mask Overlay {idx}")
-    axs[1].axis("off")
 
-    axs[2].imshow(pc_colormap)
-    axs[2].set_title(f"PC Norm Map {idx}")
-    axs[2].axis("off")
+def draw_bounding_boxes(bbox_array: np.ndarray) -> list:
+    boxes = []
+    for box_coords in bbox_array:
+        box = o3d.geometry.OrientedBoundingBox.create_from_points(
+            o3d.utility.Vector3dVector(box_coords.astype(np.float64))
+        )
+        box.color = (0.1, 0.2, 1.0)  # blue-ish
+        boxes.append(box)
+    return boxes
 
-    plt.tight_layout()
-    out_path = os.path.join(output_dir, f"visualization_{idx}.png")
-    plt.savefig(out_path)
-    plt.close(fig)
 
-def get_all_indices(data_dir):
-    pattern = re.compile(r"rgb_img_(\d+)\.png")
-    indices = []
-    for fname in os.listdir(data_dir):
-        match = pattern.match(fname)
-        if match:
-            indices.append(int(match.group(1)))
-    return sorted(indices)
+def read_rgb_image(path: str) -> np.ndarray:
+    image = Image.open(path).convert("RGB")
+    return np.array(image)
+
+
+def render_scene(cloud: o3d.geometry.PointCloud, boxes: list):
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="3D Viewer", width=1024, height=768)
+    vis.add_geometry(cloud)
+    for box in boxes:
+        vis.add_geometry(box)
+    vis.run()
+    vis.destroy_window()
+
+
+def run_viewer(data_root: str, sample_id: str):
+    pc_file = os.path.join(data_root, f"pc_{sample_id}.npy")
+    rgb_file = os.path.join(data_root, f"rgb_img_{sample_id}.png")
+    bbox_file = os.path.join(data_root, f"bbox3d_{sample_id}.npy")
+
+    point_cloud = load_array(pc_file)
+    bounding_boxes = load_array(bbox_file)
+    rgb_image = read_rgb_image(rgb_file)
+
+    pointcloud_o3d = prepare_point_cloud(point_cloud, rgb_image)
+    bbox_o3d_list = draw_bounding_boxes(bounding_boxes)
+    render_scene(pointcloud_o3d, bbox_o3d_list)
+
 
 if __name__ == "__main__":
-    data_dir = "D:\Assignment\processed_dataset"       # <-- UPDATE THIS
-    output_dir = "visualization"    # <-- UPDATE THIS
+    if len(sys.argv) != 3:
+        print(f"Usage: python {os.path.basename(__file__)} <data_folder> <sample_number>")
+        sys.exit(1)
 
-    all_indices = get_all_indices(data_dir)
-    print(f"Found {len(all_indices)} samples.")
-
-    for idx in all_indices:
-        print(f"Processing index {idx}")
-        visualize_sample(idx, data_dir, output_dir)
+    folder = sys.argv[1]
+    number = sys.argv[2]
+    run_viewer(folder, number)
